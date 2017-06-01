@@ -1,0 +1,321 @@
+---
+title: "Comparing modes with different measures of fire"
+output: 
+  word_document: 
+    fig_height: 5
+    fig_width: 7
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(tidyverse)
+library(mgcv)
+library(mxbstuff)
+
+SAMPLE.MEANS <- loadFrom( mdPath("data/sample_means.RData") )
+
+SITES <- loadFrom( mdPath("data/sites.RData") ) %>%
+  rename(nfires = firessince1986)
+
+DAT <- left_join(SITES, SAMPLE.MEANS, by = "plot") %>%
+  mutate(plot = factor( as.integer(plot) ) )
+
+FIRES <- loadFrom( mdPath("data/fires.RData") ) %>%
+  mutate(plot = factor( as.integer(plot), levels = levels(DAT$plot))) %>%
+  group_by(plot) %>%
+  summarize(sumburnp = sum(burnp / 100)) # percentage to proportion
+
+DAT <- left_join(DAT, FIRES, by = "plot")
+
+# Tonnes / ha variables
+DAT <- DAT %>%
+  mutate(carbontha = coredepth * bulkdengcm3 * totalcarbon,
+         nitrogentha = coredepth * bulkdengcm3 * totalnitrogen,
+         cnratio = carbontha / nitrogentha)
+
+GOPT <-
+  theme_bw() +
+  theme(text = element_text(size = 14))
+
+ZeroLine = geom_hline(yintercept = 0, linetype = "dashed", size = 1)
+
+HJitter = position_jitter(width = 0.15, height = 0)
+
+
+# Function to do model predictions and return a data frame
+# suitable for graphing
+do_predict <- function(model, newdata, trans = identity) {
+  fit <- predict(model, newdata, type = "response", se.fit = TRUE)
+
+  res <- cbind(
+    newdata,
+    fitted = trans(fit$fit),
+    lwr = trans(fit$fit - 2*fit$se.fit),
+    upr = trans(fit$fit + 2*fit$se.fit)
+  )
+  
+  res
+}
+
+# Weights used with existing models based on number of fires
+weightLookup <- DAT %>%
+  group_by(nfires) %>%
+  summarize(N = n()) %>%
+  mutate(weight.init = N / sum(N),
+         weight.scaled = weight.init / mean(weight.init))
+
+weights <- DAT %>%
+  select(nfires) %>%
+  left_join(weightLookup, by="nfires") %>%
+  .$weight.scaled
+
+set.seed(42)
+
+```
+
+
+## Background
+
+The previously fitted models (GAMs) for carbon, nitrogen and C/N ratio included, as the fire measure, the number of fires recorded in experimental plots since 1986. A plot was considered burnt if at least 20% of sample points within it (most n=10 but sometimes less) were burnt.
+
+Robert and Bronwyn were interested to compare models fitted with a more continuous measure of fire to account for fire patchiness. One option is to take the annual values of the proportion of sample points burnt and sum them for each plot. 
+
+The graph below compares summed burn proportions to the number of fires per plot.
+
+```{r}
+
+maxfires = max(DAT$nfires)
+
+dat <- DAT %>%
+  select(plot, logged, nfires, sumburnp) %>%
+  distinct()
+
+ggplot(data = dat, aes(x = nfires, y = sumburnp)) +
+  geom_point(aes(fill = logged),
+             shape = 21, size = 3, alpha = 0.6,
+             position = HJitter) +
+  
+  scale_x_continuous(breaks = 0:maxfires) +
+  scale_fill_discrete(name = "") +
+  
+  labs(x = "Number of fires", y = "Sum annual burn props.",
+       title = "Comparison of fire measures for each plot",
+       subtitle = "(points jittered horizontally for clarity)") +
+  
+  GOPT +
+  theme(panel.grid.minor.x = element_blank())
+
+```
+
+
+
+## Comparison of models fitted with each fire measure
+
+In the existing models with number of fires as a predictor, observations were weighted to account for varying coverage of samples over the range of fire frequencies. This avoided samples for 5 or more fires having undue influence on the overall trend, and ensured realistic bounds at that end of the trend line.
+
+Applying non-uniform weights to observations affects the AIC value of a model, so here we re-fit the existing models with observations equally weighted to allow for comparison with alternative models. This makes for a bit of mental juggling: the AIC comparison will tell us (we hope) whether summed burn proportion is more informative than number of fires, but in assessing any differences in story (ie. which variables are influential; magnitude of effects) we should refer back to the weighted models. There might be a better way to do this.
+
+In the following, *nfires* is used to denote a model fitted with number of fires while *burnp* denotes a model fitted with summed burn proportions.
+
+
+### Carbon
+
+```{r echo = TRUE}
+
+dat.model <- DAT
+dat.model$flag <- 1  # turns on site random effect
+
+# original model fitted with weighted observations
+mcarbon.nfires <- gam(
+  log(carbontha) ~ s(nfires, k=8, by = logged) +
+                 logged + treeopen +
+                 s(plot, bs = "re", by = flag),
+               
+               weights = weights,
+               data = dat.model,
+               family = gaussian())
+
+# original model re-fitted without weights
+mcarbon.nfires.unweighted <- gam(
+  log(carbontha) ~ s(nfires, k=8, by = logged) +
+                 logged + treeopen +
+                 s(plot, bs = "re", by = flag),
+               
+               data = dat.model,
+               family = gaussian())
+
+# alternative model
+mcarbon.burnp <- gam(
+  log(carbontha) ~ s(sumburnp, k=30, by = logged) +
+                 logged + treeopen +
+                 s(plot, bs = "re", by = flag),
+               
+               data = dat.model,
+               family = gaussian())
+
+```
+
+#### AIC comparison of unweighted nfires model and burnp model
+
+```{r}
+
+AIC(mcarbon.nfires.unweighted, mcarbon.burnp)
+
+```
+
+No difference is detected between the models.
+
+#### Weighted nfires model summary
+
+```{r}
+
+summary(mcarbon.nfires)
+
+```
+
+#### Burnp model summary
+
+```{r}
+
+summary(mcarbon.burnp)
+
+```
+
+
+
+### Nitrogen
+
+```{r echo = TRUE}
+
+dat.model <- DAT
+dat.model$flag <- 1  # turns on site random effect
+
+# original model fitted with weighted observations
+mnitrogen.nfires <- gam(
+  log(nitrogentha) ~ s(nfires, k=8, by = logged) +
+                 logged + treeopen +
+                 s(plot, bs = "re", by = flag),
+               
+               weights = weights,
+               data = dat.model,
+               family = gaussian())
+
+# original model re-fitted without weights
+mnitrogen.nfires.unweighted <- gam(
+  log(nitrogentha) ~ s(nfires, k=8, by = logged) +
+                 logged + treeopen +
+                 s(plot, bs = "re", by = flag),
+               
+               data = dat.model,
+               family = gaussian())
+
+# alternative model
+mnitrogen.burnp <- gam(
+  log(nitrogentha) ~ s(sumburnp, k=30, by = logged) +
+                 logged + treeopen +
+                 s(plot, bs = "re", by = flag),
+               
+               data = dat.model,
+               family = gaussian())
+
+```
+
+#### AIC comparison of unweighted nfires model and burnp model
+
+```{r}
+
+AIC(mnitrogen.nfires.unweighted, mnitrogen.burnp)
+
+```
+
+The nfires model is slightly preferred but the difference is negligible.
+
+#### Weighted nfires model summary
+
+```{r}
+
+summary(mnitrogen.nfires)
+
+```
+
+#### Burnp model summary
+
+```{r}
+
+summary(mnitrogen.burnp)
+
+```
+
+
+
+### Carbon to nitrogen ratio
+
+
+```{r echo = TRUE}
+
+dat.model <- DAT
+dat.model$flag <- 1  # turns on site random effect
+
+# original model fitted with weighted observations
+mratio.nfires <- gam(
+  log(cnratio) ~ s(nfires, k=8, by = logged) +
+                 logged + treeopen +
+                 s(plot, bs = "re", by = flag),
+               
+               weights = weights,
+               data = dat.model,
+               family = scat())
+
+# original model re-fitted without weights
+mratio.nfires.unweighted <- gam(
+  log(cnratio) ~ s(nfires, k=8, by = logged) +
+                 logged + treeopen +
+                 s(plot, bs = "re", by = flag),
+               
+               data = dat.model,
+               family = scat())
+
+# alternative model
+mratio.burnp <- gam(
+  log(cnratio) ~ s(sumburnp, k=30, by = logged) +
+                 logged + treeopen +
+                 s(plot, bs = "re", by = flag),
+               
+               data = dat.model,
+               family = scat())
+
+```
+
+#### AIC comparison of unweighted nfires model and burnp model
+
+```{r}
+
+AIC(mratio.nfires.unweighted, mratio.burnp)
+
+```
+
+The nfires model is slightly preferred.
+
+#### Weighted nfires model summary
+
+```{r}
+
+summary(mratio.nfires)
+
+```
+
+#### Burnp model summary
+
+```{r}
+
+summary(mratio.burnp)
+
+```
+
+
+## Summary
+
+The burnp models were similar to those fitted with nfires in terms AIC values for all three response variables. The general story of logging and fire effects was also much the same, although there was some movement in coefficient values as would be expected.
+
+

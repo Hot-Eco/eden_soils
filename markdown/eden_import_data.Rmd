@@ -1,0 +1,225 @@
+---
+title: "Import data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(tidyverse)
+library(stringr)
+library(mxbstuff)
+
+```
+
+
+## Data for core samples
+
+The raw data give values of carbon and nitrogen for analytical replicates sampled from each soil core. For most cores there were 3 replicates, but some had 5 and two had 19 and 22 respectively (intended to detect for analytical batch effects).
+
+The data set for sample values also includes core-level measurements (top soil depth and core weight) together with site-level variables (fire history etc).
+
+Standard samples are also included, with a text string (`standard` column) indicating the composition of the standard. The string is empty for field samples.
+
+```{r}
+
+dat <- read.csv(mdPath("data_raw/Eden_SoilData.csv"))
+
+# Fix column names 
+colnames(dat) <- colnames(dat) %>%
+  tolower() %>%
+  str_replace_all("_|\\.", "")
+
+# Add data row number (for back reference). 
+# Add a flag for field samples.
+dat <- dat %>% 
+  mutate(datarow = row_number(),
+         sample = str_trim(standard) == "")
+
+```
+
+
+Separate out data for standards. Note standards were assigned a core number which we retain here just in case.
+
+```{r}
+
+STANDARDS <- dat %>%
+  filter(!sample) %>%
+
+  select(datarow, stickerno, coreno, standard, totalcarbon, totalnitrogen) %>%
+  
+  mutate(standard = factor(str_trim(standard))) %>%
+  
+  mutate(coreno = droplevels(coreno))
+
+glimpse(STANDARDS)
+
+```
+
+
+Separate out data for field cores.
+
+```{r}
+
+SAMPLES <- dat %>%
+  filter(sample) %>%
+
+  select(datarow, plot, stickerno, coreno, treeopen, 
+         coredepth, soildepth, topsoildepth, soilcolour, weightg, bulkdengcm3,
+         totalcarbon, totalnitrogen) %>%
+
+  mutate(coreno = droplevels(coreno),
+         treeopen = droplevels(treeopen)) %>%
+
+  # Set the few blank values for soil colour to NA
+  mutate(soilcolour = as.character(soilcolour),
+         soilcolour = factor(soilcolour, exclude = "")) %>%
+
+  # Fix bulk density column which ends up as a factor because
+  # of "DIV0"" flags for standards in the input data
+  mutate(bulkdengcm3 = as.numeric( as.character(bulkdengcm3) ) )
+
+glimpse(SAMPLES)
+
+```
+
+
+Separate out site-level data.
+
+```{r}
+
+SITES <- dat %>%
+  filter(sample) %>%
+  select(plot, treatment, tsf, firessince1986) %>%
+  distinct() %>%
+  mutate(treatment = droplevels(treatment),
+         
+         harvest = factor(str_sub(treatment, 1, 1), 
+                         levels = c("U", "L"), labels = c("unharvested", "harvested")),
+         
+         firetreat = factor(str_sub(treatment, 2, 2),
+                            levels = c("N", "R", "F"), labels = c("none", "regular", "frequent"))
+  )
+
+# Check that we have only one row for each site 
+# (ie. there were no different values for site level variables)
+x <- SITES %>% 
+  group_by(plot) %>%
+  summarize(N = n()) %>%
+  filter(N > 1)
+
+if (nrow(x) > 0) stop("Inconsistent data for sites")
+
+# Fix numeric vars that have ended up as factors
+SITES <- SITES %>%
+  mutate(tsf = as.numeric( as.character(tsf) ), 
+         firessince1986 = as.numeric( as.character(firessince1986) ))
+
+glimpse(SITES)
+
+```
+
+
+### Check for missing values in field samples
+
+```{r}
+
+ii <- rowSums(is.na(SAMPLES)) > 0
+x <- SAMPLES[ii, ] %>%
+  select(datarow, everything())
+
+knitr::kable(x)
+
+```
+
+
+Calculate sample means for carbon and nitrogen. 
+
+**TODO: modify this to take into account the different numbers of replicates for different cores.**
+
+```{r}
+
+SAMPLE.MEANS <- SAMPLES %>%
+  select(-datarow, -stickerno) %>%
+  
+  group_by(coreno) %>%
+  
+  mutate(nreps = n(),
+         totalcarbon = mean(totalcarbon),
+         totalnitrogen = mean(totalnitrogen)) %>%
+  
+  ungroup() %>%
+
+  distinct(plot, coreno, .keep_all = TRUE) %>%
+  
+  select(plot, coreno, everything())
+
+glimpse(SAMPLE.MEANS)
+
+```
+
+
+From the sample means, calculate tonnes per hectare values for carbon and nitrogen and C/N ratio based on these values.
+
+```{r}
+
+SAMPLE.MEANS <- SAMPLE.MEANS %>%
+  
+  mutate(carbontha = coredepth * bulkdengcm3 * totalcarbon,
+         nitrogentha = coredepth * bulkdengcm3 * totalnitrogen) %>%
+  
+  mutate(cnratio = carbontha / nitrogentha)
+
+```
+
+
+
+## Additional data for sites
+
+Data for site locations and topography were provided in an Excel file.
+
+```{r}
+
+x <- readxl::read_excel(mdPath("data_raw/EBSA_Site_data.xlsx")) %>%
+  select(plot, easting, northing,
+         aspect = bsaaspect2,
+         slope = bsaslope25,
+         elevation = bsadem25,
+         wetness = bsawet25,
+         solar = netrad)
+
+SITES <- left_join(SITES, x, by = "plot")
+
+# Add a 'northness' variable
+SITES <- SITES %>%
+  mutate(northness = sin(0.5 * pi * aspect / 180))
+
+```
+
+Fire data for plots.
+
+```{r}
+
+# burnp is percentage of sample points (usually n=10) recorded as burnt.
+# Trent required 2 or points burnt for the plot be treated as burnt.
+
+FIRES <- read.csv( mdPath("data_raw/fire_history_2013.csv"), stringsAsFactors = FALSE) %>%
+  mutate(plot = as.integer(str_extract(plot_txt, "\\d+$"))) %>%
+  select(plot, year, burnp) %>%
+  mutate(burnt = as.integer(burnp >= 20))
+
+```
+
+
+Save data to file.
+
+```{r}
+
+save(STANDARDS, file = mdPath("data/standards.RData"))
+save(SAMPLES, file = mdPath("data/samples.RData"))
+save(SAMPLE.MEANS, file = mdPath("data/sample_means.RData"))
+save(SITES, file = mdPath("data/sites.RData"))
+save(FIRES, file = mdPath("data/fires.RData"))
+
+```
+
+

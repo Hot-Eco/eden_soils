@@ -1,0 +1,562 @@
+---
+title: 'Eden: soil carbon and nitrogen'
+output:
+  word_document:
+    fig_height: 5
+    fig_width: 7
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+
+library(tidyverse)
+library(mgcv)
+library(ncf)  # for correlograms
+library(mxbstuff)
+
+# Set to TRUE to run correlograms (time consuming)
+# or FALSE to load previously saved results
+RUN_CORRELOGRAMS <- FALSE
+
+
+SAMPLE.MEANS <- loadFrom( mdPath("data/sample_means.RData") )
+
+SITES <- loadFrom( mdPath("data/sites.RData") ) %>%
+  rename(nfires = firessince1986)
+
+DAT <- left_join(SITES, SAMPLE.MEANS, by = "plot") %>%
+  mutate(plot = factor( as.integer(plot) ) )
+
+GOPT <-
+  theme_bw() +
+  theme(text = element_text(size = 14))
+
+ZeroLine = geom_hline(yintercept = 0, linetype = "dashed", size = 1)
+
+HJitter = position_jitter(width = 0.15, height = 0)
+
+
+# Function to do model predictions and return a data frame
+# suitable for graphing
+do_predict <- function(model, newdata, trans = identity) {
+  fit <- predict(model, newdata, type = "response", se.fit = TRUE)
+
+  res <- cbind(
+    newdata,
+    fitted = trans(fit$fit),
+    lwr = trans(fit$fit - 2*fit$se.fit),
+    upr = trans(fit$fit + 2*fit$se.fit)
+  )
+  
+  res
+}
+
+
+set.seed(42)
+
+```
+
+
+## Overall modelling approach
+
+For all response variables we fit GAMs with:
+
+  * A smooth term for number of fires, fitted with a thin-plate regression spline that allows shrinkage to a linear function as dictated by the data. This is preferred to the previous cubic spline with fixed degrees of freedom because it gives trend lines that are easier to interpret and more stable where the data are sparse.
+  
+  * An interaction between number of fires and harvesting (binary variable).
+  
+  * Open vs tree micro-site.
+  
+  * Random effect term for site.
+  
+  * Weights assigned to observations based on proportion of samples for each number of fires.
+
+Validation outputs for models (graphs of residuals etc) have been kept separate to keep this document uncluttered.
+
+```{r}
+
+weightLookup <- DAT %>%
+  group_by(nfires) %>%
+  summarize(N = n()) %>%
+  mutate(weight.init = N / sum(N),
+         weight.scaled = weight.init / mean(weight.init))
+
+weights <- DAT %>%
+  select(nfires) %>%
+  left_join(weightLookup, by="nfires") %>%
+  .$weight.scaled
+
+```
+
+
+## Model for carbon
+
+From Meaghan:
+
+Carbon (t/ha) = Depth (cm) x Bulk density (g/cm3) x Carbon content (%)
+
+```{r echo = TRUE}
+
+dat.model <- DAT
+dat.model$flag <- 1  # turns on site random effect
+
+mcarbon <- gam(log(carbontha) ~ s(nfires, bs = "tp", k=8, fx=FALSE, by = harvest) +
+                 harvest + treeopen +
+                 s(plot, bs = "re", by = flag),
+               
+               data = dat.model,
+               weights = weights,
+               family = gaussian())
+
+summary(mcarbon)
+
+
+```
+
+
+Graph of model predictions
+
+```{r}
+
+dat.predict <- expand.grid(
+  nfires = 0:max(dat.model$nfires),
+  harvest = levels(dat.model$harvest),
+  treeopen = levels(dat.model$treeopen)
+)
+
+dat.predict$flag <- 0
+dat.predict$plot <- levels(dat.model$plot)[1]
+
+dat.gg <- do_predict(mcarbon, dat.predict, exp)
+
+g <- ggplot(data = dat.gg, aes(x = nfires)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr),
+              alpha = 0.4) +
+  
+  geom_point(data = dat.model,
+             aes(y = carbontha),
+             shape = 1, size = 2, colour = "grey20",
+             position = HJitter) +
+  
+  geom_line(aes(y = fitted), size = 1) +
+  
+  scale_x_continuous(breaks = 0:max(dat.gg$nfires)) +
+  
+  labs(x = "Number of fires", y = "Carbon (tonne per ha)") +
+  
+  facet_grid(treeopen ~ harvest) +
+  
+  GOPT +
+  
+  theme(panel.grid.minor = element_blank())
+
+print(g)
+
+```
+
+Same graph with log-scaling for the y-axis.
+
+```{r}
+
+g + scale_y_log10(breaks = c(50, 100, 200))
+
+```
+
+Tabulate predictions and save to file.
+
+```{r}
+
+x <- select(dat.gg, -flag, -plot) %>%
+  mutate_if(is.numeric, round, digits = 2) %>%
+  rename(mean = fitted)
+
+write.csv(x, file = "carbon.csv", row.names = FALSE)
+
+knitr::kable(x)
+
+```
+
+
+
+## Nitrogen tonnes per hectare
+
+```{r echo = TRUE}
+
+mnitrogen <- gam(log(nitrogentha) ~ s(nfires, k=8, by = harvest) +
+                 harvest + treeopen +
+                 s(plot, bs = "re", by = flag),
+               
+               data = dat.model,
+               weights = weights,
+               family = gaussian())
+
+summary(mnitrogen)
+
+```
+
+
+Graph of model predictions
+
+```{r}
+
+dat.gg <- do_predict(mnitrogen, dat.predict, exp)
+
+g <- ggplot(data = dat.gg, aes(x = nfires)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr),
+              alpha = 0.4) +
+  
+  geom_point(data = dat.model,
+             aes(y = nitrogentha),
+             shape = 1, size = 2, colour = "grey20",
+             position = HJitter) +
+  
+  geom_line(aes(y = fitted), size = 1) +
+  
+  scale_x_continuous(breaks = 0:max(dat.gg$nfires)) +
+  
+  labs(x = "Number of fires", y = "Nitrogen (tonne per ha)") +
+  
+  facet_grid(treeopen ~ harvest) +
+  
+  GOPT +
+  
+  theme(panel.grid.minor = element_blank())
+
+# graph with natural scale for y-axis
+g + scale_y_continuous(breaks = c(1, 5, 10, 15))
+
+```
+
+Same graph with log-scaling for the y-axis.
+
+```{r}
+
+g + scale_y_log10(breaks = c(1, 2.5, 5, 10))
+
+```
+
+
+Tabulate predictions and save to file.
+
+```{r}
+
+x <- select(dat.gg, -flag, -plot) %>%
+  mutate_if(is.numeric, round, digits = 2) %>%
+  rename(mean = fitted)
+
+write.csv(x, file = "nitrogen.csv", row.names = FALSE)
+
+knitr::kable(x)
+
+```
+
+## Carbon to nitrogen ratio
+
+This has been calculated as the ratio of the carbon t/ha to nitrogen t/ha values used for the above models.
+
+Distribution of values within fire x harvest classes:
+
+```{r}
+
+ggplot(data = dat.model, aes(x = cnratio)) +
+  geom_histogram(colour = "black", fill = "grey80", binwidth = 10) +
+  labs(x = "Carbon to nitrogen ratio") +
+  
+  facet_grid(treeopen ~ harvest) +
+  
+  GOPT
+
+```
+
+Ratio values versus number of fires:
+
+```{r}
+
+ggplot(data = dat.model, aes(x = nfires, y = cnratio)) +
+  geom_point(shape = 1, size = 2,
+             position = HJitter) +
+  
+  scale_x_continuous(breaks = 0:max(dat.gg$nfires)) +
+  
+  labs(x = "Number of fires", y = "Carbon to nitrogen ratio") +
+  
+  facet_grid(treeopen ~ harvest) +
+  
+  GOPT +
+  
+  theme(panel.grid.minor = element_blank())
+
+```
+
+This model is fitted using a scaled t-distribution (with the argument `family = scat`) as a heavy-tailed alternative to a Normal distribution. This was chosen after finding that the residuals from an initial Gaussian model were very poorly distributed in both tails.
+
+
+```{r echo = TRUE}
+
+mratio <- gam(log(cnratio) ~ s(nfires, k=8, by = harvest) +
+                 harvest + treeopen +
+                 s(plot, bs = "re", by = flag),
+               
+               data = dat.model,
+               weights = weights,
+               family = scat())
+
+summary(mratio)
+
+```
+
+
+Graph of model predictions
+
+```{r}
+
+dat.gg <- do_predict(mratio, dat.predict, exp)
+
+ggplot(data = dat.gg, aes(x = nfires)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr),
+              alpha = 0.4) +
+  
+  geom_point(data = dat.model,
+             aes(y = cnratio),
+             shape = 1, size = 2, colour = "grey20",
+             position = HJitter) +
+  
+  geom_line(aes(y = fitted), size = 1) +
+  
+  scale_x_continuous(breaks = 0:max(dat.gg$nfires)) +
+  
+  scale_y_continuous() +
+  
+  labs(x = "Number of fires", y = "Carbon to nitrogen ratio") +
+  
+  facet_grid(treeopen ~ harvest) +
+  
+  GOPT +
+  
+  theme(panel.grid.minor = element_blank())
+
+
+```
+
+Tabulate predictions and save to file.
+
+```{r}
+
+x <- select(dat.gg, -flag, -plot) %>%
+  mutate_if(is.numeric, round, digits = 2) %>%
+  rename(mean = fitted)
+
+write.csv(x, file = "cnratio.csv", row.names = FALSE)
+
+knitr::kable(x)
+
+```
+
+
+
+## Extra graphs
+
+### Carbon (percentage by weight) vs top soil depth
+
+Points have been horizontally jittered for clarity.
+
+```{r}
+
+dat <- filter(DAT, !is.na(topsoildepth))
+
+ggplot(data = dat, aes(x = topsoildepth, y = totalcarbon)) +
+  geom_point(shape = 1, size = 2, 
+             position = position_jitter(width = 0.15, height = 0)) +
+  
+  labs(x = "Top soil depth (cm)", y = "Total carbon (%)") +
+  
+  facet_grid(treeopen ~ harvest) +
+  GOPT
+
+```
+
+
+### Carbon (tonnes per ha) vs top soil depth
+
+Points have been horizontally jittered for clarity.
+
+```{r}
+
+dat <- filter(dat.model, !is.na(topsoildepth))
+
+ggplot(data = dat, aes(x = topsoildepth, y = carbontha)) +
+  geom_point(shape = 1, size = 2, 
+             position = position_jitter(width = 0.15, height = 0)) +
+  
+  labs(x = "Top soil depth (cm)", y = "Total carbon (t/ha)") +
+  
+  facet_grid(treeopen ~ harvest) +
+  GOPT
+
+```
+
+
+### Graphical check for spatial correlation
+
+The following graphs (correlograms) show how the correlation between observations varies with distance between them. Correlation is measured as Moran's *I* with point-wise bounds derived from bootstrap resampling. We use the `spline.correlog` function from the `ncf` package to fit a smooth trend line and avoid having to define distance classes for calculation.
+
+For each response variable we examine spatial correlation in values of the variable itself, and in the residuals of the model fitted for that variable.
+
+```{r}
+
+library(ncf)
+
+ggplot.spline.correlog <- function (obj,
+                                    xlab = "Distance", 
+                                    ylab = "Moran's I") {
+
+  dat.fitted <- data_frame(
+    x = obj$real$predicted$x,
+    y = obj$real$predicted$y
+  )
+  
+  dat.bounds <- data_frame(
+    x = obj$boot$boot.summary$predicted$x[1, ],
+    lwr = obj$boot$boot.summary$predicted$y["0.025", ],
+    upr = obj$boot$boot.summary$predicted$y["0.975", ]
+  )
+  
+  ggplot() +
+    geom_ribbon(data = dat.bounds, 
+                aes(x = x, ymin = lwr, ymax = upr),
+                fill = "grey80") +
+    
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    
+    geom_line(data = dat.fitted, aes(x = x, y = y)) +
+    
+    labs(x = xlab, y = ylab)
+}
+
+```
+
+#### Carbon t/ha values
+
+```{r c.cor}
+
+path <- mdPath("model_outputs/cg_carbon.RData")
+
+if (RUN_CORRELOGRAMS) {
+  cg.carbon <- spline.correlog(x = dat.model$easting, 
+                               y = dat.model$northing, 
+                               z = dat.model$carbontha,
+                               quiet = TRUE)
+  save(cg.carbon, file = path)
+} else {
+  load( path )
+}
+
+ggplot.spline.correlog(cg.carbon) + GOPT
+
+```
+
+#### Carbon model residuals
+
+```{r c.res.cor}
+
+path <- mdPath("model_outputs/cg_carbon_resid.RData")
+
+if (RUN_CORRELOGRAMS) {
+  cg.carbon.resid <- spline.correlog(x = dat.model$easting, 
+                                     y = dat.model$northing, 
+                                     z = resid(mcarbon, type = "pearson"),
+                                     quiet = TRUE)
+  save(cg.carbon.resid, file = path)
+} else {
+  load( path )
+}
+
+ggplot.spline.correlog(cg.carbon.resid) + GOPT
+
+```
+
+
+#### Nitrogen t/ha values
+
+```{r n.cor}
+
+path <- mdPath("model_outputs/cg_nitrogen.RData")
+
+if (RUN_CORRELOGRAMS) {
+  cg.nitrogen <- spline.correlog(x = dat.model$easting, 
+                                 y = dat.model$northing, 
+                                 z = dat.model$nitrogentha,
+                                 quiet = TRUE)
+  save(cg.nitrogen, file = path)
+} else {
+  load( path )
+}
+
+ggplot.spline.correlog(cg.nitrogen) + GOPT
+
+```
+
+#### Nitrogen model residuals
+
+```{r n.res.cor}
+
+path <- mdPath("model_outputs/cg_nitrogen_resid.RData")
+
+if (RUN_CORRELOGRAMS) {
+  cg.nitrogen.resid <- spline.correlog(x = dat.model$easting, 
+                                       y = dat.model$northing, 
+                                       z = resid(mnitrogen, type = "pearson"),
+                                       quiet = TRUE)
+  save(cg.nitrogen.resid, file = path)
+} else {
+  load( path )
+}
+
+ggplot.spline.correlog(cg.nitrogen.resid) + GOPT
+
+```
+
+
+
+#### Carbon / nitrogen ratio
+
+```{r cn.cor}
+
+path <- mdPath("model_outputs/cg_ratio.RData")
+
+if (RUN_CORRELOGRAMS) {
+  cg.ratio <- spline.correlog(x = dat.model$easting, 
+                              y = dat.model$northing, 
+                              z = dat.model$cnratio,
+                              quiet = TRUE)
+  save(cg.ratio, file = path)
+} else {
+  load( path )
+}
+  
+ggplot.spline.correlog(cg.ratio) + GOPT
+
+```
+
+#### Carbon / nitrogen ratio model residuals
+
+```{r cn.res.cor}
+
+path <- mdPath("model_outputs/cg_ratio_resid.RData")
+
+if (RUN_CORRELOGRAMS) {
+  cg.ratio.resid <- spline.correlog(x = dat.model$easting, 
+                                    y = dat.model$northing, 
+                                    z = resid(mratio, type = "pearson"),
+                                    quiet = TRUE)
+  save(cg.ratio.resid, file = path)
+} else {
+  load( path )
+}
+
+ggplot.spline.correlog(cg.ratio.resid) + GOPT
+
+```
+
+

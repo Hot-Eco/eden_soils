@@ -1,0 +1,117 @@
+---
+title: "GAM vs GAMM4 random effects formulation"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+
+library(tidyverse)
+library(mgcv)
+library(gamm4)
+library(mxbstuff)
+
+SAMPLE.MEANS <- loadFrom( mdPath("data/sample_means.RData") )
+
+SITES <- loadFrom( mdPath("data/sites.RData") ) %>%
+  rename(nfires = firessince1986)
+
+DAT <- left_join(SITES, SAMPLE.MEANS, by = "plot") %>%
+  
+  mutate(plot = factor( as.integer(plot) ),
+         nitrogentha = coredepth * bulkdengcm3 * totalnitrogen)
+
+GOPT <-
+  theme_bw() +
+  theme(text = element_text(size = 14))
+
+ZeroLine = geom_hline(yintercept = 0, linetype = "dashed", size = 1)
+
+HJitter = position_jitter(width = 0.15, height = 0)
+
+
+# Function to do model predictions and return a data frame
+# suitable for graphing
+do_predict <- function(model, newdata, trans = identity) {
+  fit <- predict(model, newdata, type = "response", se.fit = TRUE)
+
+  res <- cbind(
+    newdata,
+    fitted = trans(fit$fit),
+    lwr = trans(fit$fit - 2*fit$se.fit),
+    upr = trans(fit$fit + 2*fit$se.fit)
+  )
+  
+  res
+}
+
+dat.model <- DAT
+
+
+weightLookup <- DAT %>%
+  group_by(nfires) %>%
+  summarize(N = n()) %>%
+  mutate(weight.init = N / sum(N),
+         weight.scaled = weight.init / mean(weight.init))
+
+weights <- DAT %>%
+  select(nfires) %>%
+  left_join(weightLookup, by="nfires") %>%
+  .$weight.scaled
+
+```
+
+
+## GAM
+
+Fitting model for nitrogen where there was some signal in relation to fire.
+
+```{r}
+
+mnitrogen <- gam(log(nitrogentha) ~ s(nfires, k=8, by = logged) +
+                   logged + treeopen +
+                   s(plot, bs = "re"),
+                 
+                 data = DAT,
+                 weights = weights,
+                 family = gaussian())
+
+summary(mnitrogen)
+
+```
+
+
+## GAMM4
+
+```{r}
+
+mnitrogen.g4 <- gamm4(log(nitrogentha) ~ s(nfires, k=8, by = logged) +
+                        logged + treeopen,
+                      
+                      data = DAT,
+                      weights = weights,
+                      family = gaussian(),
+                      
+                      random = ~(1|plot))
+
+```
+
+
+Summary of the gam component:
+
+```{r}
+summary(mnitrogen.g4$gam)
+
+```
+
+
+Summary of lmer component:
+
+```{r}
+
+summary(mnitrogen.g4$mer)
+
+```
+
+

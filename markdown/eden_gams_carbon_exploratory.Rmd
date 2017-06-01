@@ -1,0 +1,687 @@
+---
+title: "Total carbon in relation to logging and fire"
+output:
+  word_document:
+    fig_height: 5
+    fig_width: 7
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+
+library(tidyverse)
+library(mgcv)
+library(mxbstuff)
+
+SAMPLE.MEANS <- loadFrom( mdPath("data/sample_means.RData") )
+
+SITES <- loadFrom( mdPath("data/sites.RData") ) %>%
+  rename(nfires = firessince1986)
+
+DAT <- left_join(SITES, SAMPLE.MEANS, by = "plot") %>%
+  mutate(plot = factor( as.integer(plot) ) )
+
+GOPT <-
+  theme_bw() +
+  theme(text = element_text(size = 14))
+
+ZeroLine = geom_hline(yintercept = 0, linetype = "dashed", size = 1)
+
+HJitter = position_jitter(width = 0.15, height = 0)
+
+
+# Function to do model predictions and return a data frame
+# suitable for graphing
+do_predict <- function(model, newdata, trans = identity) {
+  fit <- predict(model, newdata, type = "response", se.fit = TRUE)
+
+  res <- cbind(
+    newdata,
+    fitted = trans(fit$fit),
+    lwr = trans(fit$fit - 2*fit$se.fit),
+    upr = trans(fit$fit + 2*fit$se.fit)
+  )
+  
+  res
+}
+
+
+```
+
+
+## First model
+
+### Terms
+
+  1. **harvest:** unharvested (ref) vs harvested
+  
+  1. **number of fires:** count of fires since 1986
+  
+  1. **fire x harvest:** interaction term
+  
+  1. **micro-site:** open (ref) vs tree
+  
+  1. **plot random effect:** to account for spatial clustering between cores within a plot as well as topographic and sources of site-level variation that we are not representing explicitly.
+  
+  
+### Distribution and link function
+
+The data summary graphs show that the variance in total carbon increases with the mean. This suggests using Gamma or Tweedie distributions, both of which have this property. However, we will start by simply log-transforming the response variable and using a Gaussian distribution with identity link function as this is simple and also consistent with the approach used for the chrono-sequence analyses.
+
+
+### Sampling adequacy
+  
+At the site level, sampling is well balanced for logging but few sites have 5 or more fires and they are unevenly divided between harvested and unharvested.
+
+```{r}
+
+dat <- SITES %>%
+  group_by(harvest, nfires) %>%
+  summarize(nplots = n()) %>%
+  spread(nfires, nplots, sep=".", fill = 0)
+
+knitr::kable(dat, 
+             col.names = c("harvest", "no fire", "1 fire", paste(2:7, "fires")),
+             align = "lcccccccc",
+             caption = "title")
+
+```
+
+#### Option 1: keep number of fires as (sort of) continuous
+
+If we include number of fires as a parametric (unsmoothed) term we will likely end up with a linear trend having artificially narrow bounds at the right-hand end as shown here:
+
+```{r}
+
+g <- ggplot(data = DAT, aes(x = nfires, y = totalcarbon)) +
+  geom_point(shape = 1, size = 2,
+             position = HJitter) +
+  
+  labs(x = "number of fires", y = "total carbon (%)") +
+  
+  facet_grid(treeopen ~ harvest) +
+  GOPT
+  
+g + geom_smooth(method = "lm") +
+  labs(title = "Total carbon as a linear function of number of fires")
+
+```
+
+If we fit a smooth term in a GAM the same thing will happen because, with the default penalized regression spline, the smooth function will be reduced to linear with these data.
+
+Fitting a LOESS curve to the scatter plot above gives a better idea of what we want. Note the trumpety (Meaghan's term) bounds where the data are sparse.
+
+```{r}
+
+g + geom_smooth(method = "loess", method.args = list(span = 0.5)) +
+  labs(title = "Total carbon as a LOESS function of number of fires")
+
+```
+
+We want to achieve something similarly flexible (non-linear if appropriate) but conservative (realistic bounds) in a generalized additive model. One approach is to assign weights to the observations proportional to the total number of samples available for each count value. This allows more variance for the fitted trend where samples are fewer. The weight for a sample with fire count $k$ is given by:
+
+$$w_k = n_k / N$$
+where $n_k$ is the number of samples for $k$ fires and $N$ is the total number of samples. Weights are then scaled by dividing each by the mean of the initial weights which conserves the overall magnitude of the log likelihood of the fitted model (Wood 2016).
+
+```{r}
+
+weightLookup <- DAT %>%
+  group_by(nfires) %>%
+  summarize(N = n()) %>%
+  mutate(weight.init = N / sum(N),
+         weight.scaled = weight.init / mean(weight.init))
+
+weights <- DAT %>%
+  select(nfires) %>%
+  left_join(weightLookup, by="nfires") %>%
+  .$weight.scaled
+
+knitr::kable(weightLookup, digits = 3,
+             col.names = c("N fires", "N obs", "Intial wt", "Scaled wt"))
+
+```
+
+
+In addition to assigning weights to observations, we also fit the smooth term for number of fires as a fixed regression spline, rather than the default penalized regression spline. This requires that we specify the basis dimension (wiggliness) of the spline *a priori*. The univariate LOESS curves above suggest a spline with 2 internal knots should be enough to represent non-linearities without over-fitting.
+
+
+#### Option 2: Reduce number of fires to a categorical variable
+
+Example: 0-1 fires; 2-3 fires; 4 or more fires
+
+```{r}
+
+x <- DAT %>%
+  mutate(fnfires = cut(nfires, 
+                       breaks = c(-1, 2, 4, Inf), 
+                       right = FALSE,
+                       labels = c("0to1", "2to3", "4plus"))) %>%
+  
+  group_by(harvest, fnfires) %>%
+  summarize(N = n()) %>%
+  
+  spread(fnfires, N)
+
+knitr::kable(x)
+
+```
+
+
+
+## Fit first model with fires as continuous
+
+The model has:
+
+  * A smooth term for number of fires, fitted with fixed degrees of freedom. 
+
+  * An interaction between fire and logging.
+
+  * Other terms as described above.
+
+  * Weights applied to observations.
+
+```{r echo = TRUE}
+
+dat.model <- DAT
+dat.model$flag <- 1  # turns on site random effect
+
+m1 <- gam(log(totalcarbon) ~ s(nfires, bs = "cr", k=4, fx=TRUE, by=harvest) +
+            harvest + treeopen +
+            s(plot, bs = "re", by = flag),
+          
+          data = dat.model,
+          weights = weights,
+          family = gaussian())
+
+summary(m1)
+
+```
+
+### Model validation
+
+Checking residuals against fitted values:
+
+```{r}
+
+dat <- data_frame(
+  r = resid(m1),
+  fitted = fitted(m1)
+)
+
+ggplot(data = dat, aes(x = fitted, y = r)) +
+  geom_point(shape = 1, size = 2) +
+  ZeroLine +
+  
+  labs(x = "Fitted value", y = "Deviance residual") +
+  GOPT
+
+```
+
+Checking residuals against categorical predictors:
+
+```{r}
+
+dat <- cbind(r = resid(m1), select(dat.model, harvest, treeopen)) %>%
+  gather(variable, value, -r)
+
+ggplot(data = dat, aes(x = value, y = r)) +
+  geom_point(shape = 1, size = 2,
+             position = HJitter) +
+  ZeroLine +
+  
+  labs(x = "", y = "Deviance residual") +
+  facet_wrap(~ variable, scales = "free_x") +
+  GOPT
+
+```
+
+Checking residuals against number of fires:
+
+```{r}
+
+dat <- cbind(r = resid(m1), select(dat.model, nfires))
+
+ggplot(data = dat, aes(x = nfires, y = r)) +
+  geom_point(shape = 1, size = 2,
+             position = HJitter) +
+  
+  ZeroLine +
+  
+  scale_x_continuous(breaks = 0:max(dat$nfires)) +
+  
+  labs(x = "Number of fires", y = "Deviance residual") +
+  
+  GOPT +
+  
+  theme(panel.grid.minor = element_blank())
+
+
+```
+
+
+Checking observed response against fitted values:
+
+```{r}
+
+dat <- cbind(fitted = exp(fitted(m1)), select(dat.model, totalcarbon))
+
+ggplot(data = dat, aes(x = fitted, y = totalcarbon)) +
+  geom_point(shape = 1, size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", size = 1) +
+  
+  labs(x = "Fitted value", y = "Total carbon (%)") +
+  
+  GOPT
+
+```
+
+It looks like there is some systematic drift here, with a tendency to over-predict at the low end of the range and under-predict at the high end, but remember that we are fitting the model to *log(total carbon)* and back-transforming the fitted values for this graph will tend to exaggerate any such drift.
+
+Putting the graph on a log-scale:
+
+```{r}
+
+last_plot() +
+  scale_x_log10(breaks = 2:5) +
+  scale_y_log10(breaks = c(2, 5, 10)) +
+  geom_smooth(method = "lm")
+
+```
+
+
+Now the effect appears less pronounced, but there is still a systematic departure. This could suggest we need to further variables to the model.
+
+Checking residuals against top soil depth (points slightly jittered horizontally for clarity):
+
+```{r}
+
+dat <- cbind(r = resid(m1), select(dat.model, topsoildepth)) %>%
+  filter(!is.na(topsoildepth))
+
+ggplot(data = dat, aes(x = topsoildepth, y = r)) +
+  geom_point(shape = 1, size = 2, 
+             position = HJitter) +
+  
+  ZeroLine +
+  
+  geom_smooth(method = "lm") +
+  
+  labs(x = "Top soil depth (cm)", y = "Deviance residual") +
+  GOPT
+
+
+```
+
+It looks like there is a correlation between the model residuals and top soil depth. Check this by fitting a linear model:
+
+```{r}
+
+summary(lm(r ~ topsoildepth, data = dat))
+
+```
+
+The linear model supports the trend in the residuals, albeit with a lot of scatter.
+
+### Adding top soil depth to the model
+
+Adding top soil depth to the model as a smooth term and comparing the fit to that of the original model with AIC:
+
+```{r echo = TRUE}
+
+m2 <- gam(log(totalcarbon) ~ s(nfires, bs = "cr", k=4, fx=TRUE, by = harvest) +
+            s(topsoildepth) +
+            harvest + treeopen +
+            s(plot, bs = "re", by = flag),
+          
+          data = dat.model,
+          weights = weights,
+          family = gaussian())
+
+AIC(m1, m2)
+
+```
+
+The new model is clearly preferred over the original model.
+
+Examining the fitted model coefficients:
+
+```{r}
+
+summary(m2)
+
+```
+
+
+Plotting the fitted functions for smooth terms:
+
+```{r}
+
+plot(m2, pages = 1, shade = TRUE, scale = 0)
+
+```
+
+Although there is some collinearity between top soil depth and number of fires, it is relatively small (Pearson correlation coefficient = -0.21) and well below a level that would rule out including both variables. This, together with the trend that existed between the residuals of the original model and top soil depth, both support including soil depth in the model.
+
+Most cores contained 20cm of soil with some portion of that being top soil. The core material was homogenized prior to measurement of carbon. Assuming that most of the carbon was in the top soil fraction this is akin to dealing with a dilution factor and it is therefore not surprising that adding the variable results in a marked improvement in the model fit.
+
+Looking at the fitted smooth function for top soil depth (bottom left-hand panel above), there is a positive effect for depths up to 10cm after which it levels off. Meaghan commented that this is what she would expect to see given how the samples were collected and processed.
+
+### Graph of model predictions
+
+Note: the y-axis is log-10 scaled for clarity.
+
+```{r}
+
+# top soil depths
+tsd <- c(2, 5, 10)
+
+dat.predict <- expand.grid(
+  harvest = levels(dat.model$harvest),
+  nfires = sort(unique(dat.model$nfires)),
+  treeopen = levels(dat.model$treeopen),
+  topsoildepth = tsd
+)
+
+dat.predict$plot <- levels(DAT$plot)[1]
+dat.predict$flag <- 0
+
+dat.gg <- do_predict(m2, dat.predict, trans = exp) %>%
+  mutate(topsoildepth = factor(topsoildepth))
+
+ggplot(data = dat.gg, aes(x = nfires)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr, group = topsoildepth),
+              alpha = 0.1) +
+  
+  geom_point(data = dat.model,
+             aes(y = totalcarbon),
+             shape = 1, size = 2, colour = "grey40",
+             position = HJitter) +
+  
+  geom_line(aes(y = fitted, colour = topsoildepth),
+            size = 1) +
+  
+  scale_color_discrete(name = "Top soil \ndepth", labels = paste(tsd, "cm")) +
+  
+  scale_x_continuous(breaks = 0:max(dat.gg$nfires)) +
+  
+  scale_y_log10(breaks = c(1, 2, 5, 10)) +
+  
+  labs(x = "Number of fires", y = "Total carbon (%)",
+       subtitle = "Vertical bars indicate 95% intervals") +
+  
+  facet_grid(treeopen ~ harvest) +
+  
+  GOPT +
+  
+  theme(panel.grid.minor = element_blank())
+
+```
+
+
+
+### Lack of fire effect in the initial models
+
+Fire did not appear to have any effect in either of the models so far. Here we fit the model without an interaction term to see if this changes the coefficient estimate for fire:
+
+```{r echo = TRUE}
+
+m3 <- gam(log(totalcarbon) ~ s(nfires, k=4, bs = "cr", fx = TRUE) +
+            s(topsoildepth) +
+            harvest + treeopen +
+            s(plot, bs = "re", by = flag),
+          
+          data = dat.model,
+          weights = weights,
+          family = gaussian())
+
+summary(m3)
+
+```
+
+Still no fire effect.  
+
+Graphing the fitted smooth function together with partial residuals:
+
+```{r}
+
+plot(m3, select = 1, shade = TRUE, residuals = TRUE, cex = 2)
+
+```
+
+Next we remove the constraint on the smooth term for number of fires, allowing the GAM algorithm to reduce to a linear function:
+
+```{r echo = TRUE}
+
+m4 <- gam(log(totalcarbon) ~ s(nfires, k=4, bs = "cr") +
+            s(topsoildepth) +
+            harvest + treeopen +
+            s(plot, bs = "re", by = flag),
+          
+          data = dat.model,
+          weights = weights,
+          family = gaussian())
+
+summary(m4)
+
+```
+
+Number of fires becomes border-line influential.
+
+Examining the fitted smooth function:
+
+```{r}
+
+plot(m4, select = 1, shade = TRUE, residuals = TRUE, cex = 2)
+
+```
+
+
+As expected it was reduced to a linear function with unrealistically narrow bounds at the right-hand end.
+
+Finally, we drop the term for soil depth:
+
+```{r echo = TRUE}
+
+m5 <- gam(log(totalcarbon) ~ s(nfires, k=4, bs = "cr") +
+            harvest + treeopen +
+            s(plot, bs = "re", by = flag),
+          
+          data = dat.model,
+          weights = weights,
+          family = gaussian())
+
+summary(m5)
+
+```
+
+Et voila!  We have created a fire effect!  
+
+### Summary of fire effect - now you see me, now you don't
+
+If the response is taken to be percent carbon in (mostly) top 20cm of homogenized soil then there is the suggestion of a fire effect. However, the effect is weak at best and it can be argued that it is an artifact of fitting a linear function with only a small number of samples available for 5 or more fires. The effect is not present when we constrain the smooth term so that the bounds at the right-hand end reflect the paucity of data (Meaghan's trumpet). 
+
+If the response is taken to be percent carbon conditioned on the depth of top soil, there is no fire effect.
+
+
+## Fit model with fires as categorical variable
+
+Here we reduce the number of fires to a three-level categorical variable and fit this in interaction with logging. Top soil depth is included in the model.
+
+```{r echo = TRUE}
+
+dat.model <- dat.model %>%
+  mutate(fnfires = cut(nfires, 
+                       breaks = c(-1, 2, 4, Inf), 
+                       right = FALSE,
+                       labels = c("0to1", "2to3", "4plus")))
+
+m6 <- gam(log(totalcarbon) ~ fnfires*harvest +
+            s(topsoildepth) +
+            treeopen +
+            s(plot, bs = "re", by = flag),
+          
+          data = dat.model,
+          weights = weights,
+          family = gaussian())
+
+summary( m6 )
+
+```
+
+Compare this to the second model with fires treated as continuous:
+
+```{r}
+
+AIC(m2, m6)
+
+```
+
+The new model is slightly preferred but the story is much the same.
+
+Dropping the interaction term between logging and fire:
+
+```{r echo = TRUE}
+
+m7 <- gam(log(totalcarbon) ~ fnfires + harvest +
+            s(topsoildepth) +
+            treeopen +
+            s(plot, bs = "re", by = flag),
+          
+          data = dat.model,
+          weights = weights,
+          family = gaussian())
+
+summary(m7)
+
+```
+
+Now the *4plus* fire category has edged towards influential, but the standard error is still large relative to the coefficient estimate.
+
+```{r}
+
+AIC(m2, m4, m7)
+
+```
+
+On the basis of AIC, this model is preferred over the second model with the fixed smooth term for fire and is on-par with the fourth model which had a linear term for fire.
+
+### Graph of model predictions
+
+Note: the y-axis uses a log10 scale 
+
+```{r}
+
+# top soil depths
+tsd <- c(2, 5, 10)
+
+dat.predict <- expand.grid(
+  harvest = levels(dat.model$harvest),
+  fnfires = levels(dat.model$fnfires),
+  treeopen = levels(dat.model$treeopen),
+  topsoildepth = tsd
+)
+
+dat.predict$plot <- levels(DAT$plot)[1]
+dat.predict$flag <- 0
+
+dat.gg <- do_predict(m7, dat.predict, trans = exp) %>%
+  mutate(topsoildepth = factor(topsoildepth))
+
+ggplot(data = dat.gg, aes(x = fnfires, colour = topsoildepth)) +
+  geom_line(aes(y = fitted, group = topsoildepth),
+            linetype = "dashed") +
+  
+  geom_point(data = dat.model,
+             aes(y = totalcarbon),
+             shape = 1, size = 2, colour = "grey40",
+             position = HJitter) +
+  
+  geom_linerange(aes(ymin = lwr, ymax = upr),
+                  size = 1.5,
+                  position = position_dodge(width = 0.5)) +
+  
+  scale_color_discrete(name = "Top soil \ndepth", labels = paste(tsd, "cm")) +
+  
+  scale_y_log10(breaks = c(1, 2, 5, 10)) +
+  
+  labs(x = "Number of fires", y = "Total carbon (%)",
+       subtitle = "Vertical bars indicate 95% intervals") +
+  
+  facet_grid(treeopen ~ harvest) +
+  
+  GOPT +
+  
+  theme(panel.grid.minor = element_blank())
+
+```
+
+
+## Carbon mass per hectare as response variable
+
+From Meaghan:
+
+Mass of Carbon (Mg ha-1 C) = Depth (cm) x Bulk density (g/cm3) x Carbon content (%)
+
+```{r}
+
+dat.model <- dat.model %>%
+  mutate(carbontha = coredepth * bulkdengcm3 * totalcarbon)
+
+m8 <- gam(log(carbontha) ~ s(nfires, bs = "cr", k=4, fx=TRUE, by = harvest) +
+            harvest + treeopen +
+            s(plot, bs = "re", by = flag),
+          
+          data = dat.model,
+          weights = weights,
+          family = gaussian())
+
+summary(m8)
+
+```
+
+
+We can't compare this model to the previous ones using AIC because of the altered response variable, but note that its R-squared value is considerably lower than that of the equivalent model with percent carbon as a response.
+
+### Graph of model predictions
+
+```{r}
+
+dat.predict <- expand.grid(
+  nfires = 0:7,
+  harvest = levels(dat.model$harvest),
+  treeopen = levels(dat.model$treeopen)
+)
+
+dat.predict$flag <- 0
+dat.predict$plot <- levels(dat.model$plot)[1]
+
+dat.gg <- do_predict(m8, dat.predict, exp)
+
+ggplot(data = dat.gg, aes(x = nfires)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr),
+              alpha = 0.1) +
+  
+  geom_point(data = dat.model,
+             aes(y = carbontha),
+             shape = 1, size = 2, colour = "grey40",
+             position = HJitter) +
+  
+  geom_line(aes(y = fitted), size = 1) +
+  
+  scale_x_continuous(breaks = 0:max(dat.gg$nfires)) +
+  
+  #scale_y_log10(breaks = c(1, 2, 5, 10)) +
+  
+  labs(x = "Number of fires", y = "Carbon (tonne per ha)") +
+  
+  facet_grid(treeopen ~ harvest) +
+  
+  GOPT +
+  
+  theme(panel.grid.minor = element_blank())
+
+
+```
+
+

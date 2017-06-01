@@ -1,0 +1,625 @@
+---
+title: 'Eden soils: data exploration'
+output:
+  word_document:
+    fig_height: 5
+    fig_width: 8
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(tidyverse)
+library(raster)
+library(rgdal)
+library(mxbstuff)
+
+# give preference to dplyr function
+select <- dplyr::select
+
+SAMPLE.MEANS <- loadFrom(mdPath("data/sample_means.RData"))
+
+SITES <- loadFrom(mdPath("data/sites.RData"))
+
+DAT <- left_join(SITES, SAMPLE.MEANS, by = "plot")
+
+RDEM <- raster(mdPath("gis/Eden_soils_DEM.tif"))
+
+GOPT <-
+  theme_bw() +
+  theme(text = element_text(size = 20))
+
+```
+
+
+## Design and measurement
+
+Sites were located to sample logging experiment treatment classes and a range of topographic positions. Within each site, three soil cores were collected from each of two micro-sites: near tree and open. Top soil depth and soil mass was recorded for each core.
+
+Replicate analytical samples were taken from each core, usually three but sometimes more [*Why different numbers?  Should we take this into account when calculating sample means?*]. 
+
+For analysis we use the mean of the analytical replicates for each core.
+
+## Soil bulk density
+
+Bulk density values in relation to logging. The y-axis is on an exponential scale which gives a fairly symmetrical distribution to make visual comparison easier. Bars indicate approximate 95% interval around the mean. 
+
+```{r}
+
+q <- DAT %>%
+  group_by(harvest) %>%
+  summarize(mean = mean(bulkdengcm3),
+            se = sd(bulkdengcm3) / sqrt(n()),
+            lwr = mean - 2 * se, 
+            upr = mean + 2 * se)
+
+
+g <- ggplot(data = DAT, aes(x = harvest, y = bulkdengcm3)) + 
+  geom_violin() + 
+  
+  geom_point(position = position_jitter(width = 0.15, height = 0)) + 
+  
+  scale_y_continuous(trans = "exp") + 
+  
+  labs(x = "", y = expression(paste("Bulk density (g ", cm^-3, ")"))) +
+  
+  GOPT
+
+segw <- 0.2
+segf <- function(x, sgn) { as.numeric(x) + sgn*segw }
+
+g <- g + 
+  geom_errorbar(data = q,
+                aes(x = harvest, ymin = lwr, ymax = upr),
+                colour = "blue", width = 2 * segw, size = 1,
+                inherit.aes = FALSE)
+
+g
+
+```
+
+A quick regression, treating the bulk density values as Gamma distributed:
+
+```{r echo = TRUE}
+
+m <- glm(bulkdengcm3 ~ harvest, data = DAT, family = Gamma(link = "identity"))
+summary(m)
+
+```
+
+
+## Top soil depth
+
+```{r}
+
+q <- DAT %>%
+  group_by(harvest) %>%
+  summarize(mean = mean(topsoildepth, na.rm = TRUE),
+            se = sd(topsoildepth, na.rm = TRUE) / sqrt(n()),
+            lwr = mean - 2 * se, 
+            upr = mean + 2 * se)
+
+
+g <- ggplot(data = DAT, aes(x = harvest, y = topsoildepth)) + 
+  geom_violin() + 
+  
+  geom_point(position = position_jitter(width = 0.15, height = 0)) + 
+  
+  scale_y_continuous(trans = "identity") + 
+  
+  labs(x = "", y = "Top soil depth") +
+  
+  GOPT
+
+segw <- 0.2
+segf <- function(x, sgn) { as.numeric(x) + sgn*segw }
+
+g <- g + 
+  geom_errorbar(data = q,
+                aes(x = harvest, ymin = lwr, ymax = upr),
+                colour = "blue", width = 2 * segw, size = 1,
+                inherit.aes = FALSE)
+
+g
+
+```
+
+A quick regression, treating top soil depth values. Note that we add a small value to the zero depth values to allow us to use the Gamma distribution.
+
+```{r echo = TRUE}
+
+tsdepth <- pmax(0.01, DAT$topsoildepth)
+
+m <- glm(tsdepth ~ harvest, data = DAT, family = Gamma(link = "identity"))
+
+summary(m)
+
+```
+
+While the regression finds a logging signal, the effect size is very small: 0.6cm reduction for harvested sites.
+
+
+## Number of fires per site
+
+```{r}
+
+x <- SITES %>%
+  group_by(plot, harvest, firessince1986) %>%
+  summarize(N = n())
+
+ggplot(data = x, aes(x = firessince1986)) +
+  geom_histogram(binwidth = 1, fill = "grey90", colour = "black") +
+  
+  scale_x_continuous(breaks = 0:7) +
+  
+  labs(x = "Number of fires", y = "Number of sites") +
+  
+  GOPT +
+  
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  
+  facet_wrap(~ harvest)
+
+```
+
+
+## Burning prescription vs actual fires
+
+Sites were allocated to three fire treatment classes: no fire; regular fire (~ 4 years); frequent fire (~ 2 years).
+Actual fires departed from these prescriptions.
+
+```{r}
+
+maxfires = max(SITES$firessince1986)
+
+ggplot(data = SITES, aes(x = firetreat, y = firessince1986)) +
+  geom_point(size = 3, shape = 1, position = position_jitter(width = 0.15, height = 0)) +
+
+  scale_y_continuous(breaks = 0:maxfires) +
+  
+  labs(x = "Fire prescription", y = "Actual number of fires") +
+  GOPT
+
+```
+
+Tabulated:
+
+```{r}
+
+dat <- SITES %>%
+  group_by(firetreat, firessince1986) %>%
+  summarize(N = n()) %>%
+  spread(firessince1986, N, fill = 0)
+
+knitr::kable(dat, col.names = c("treatment", "no fire", "1 fire", paste(2:7, "fires")))
+
+```
+
+
+## Total carbon and nitrogen
+
+### Distribution of values
+
+This graph shows total carbon values for individual cores against site means. As expected, variance increases with the mean in all combinations of harvest and micro-site. A Gamma distribution might be an appropriate choice for modelling.
+
+```{r}
+
+dat <- DAT %>%
+  select(plot, harvest, treeopen, totalcarbon) %>%
+  
+  group_by(plot) %>%
+  
+  mutate(plotmean = mean(totalcarbon),
+         plotsd = sd(totalcarbon)) %>%
+  
+  group_by(harvest, treeopen) %>%
+  
+  arrange(plotmean) %>%
+  
+  ungroup()
+
+
+ggplot(data = dat, aes(x = plotmean, y = totalcarbon)) +
+  geom_point(size = 2, shape = 1) +
+
+  labs(x = "Mean plot value", y = "Core value") +
+  
+  GOPT +
+  
+  facet_grid(harvest ~ treeopen)
+
+
+```
+
+
+The same view for nitrogen. The trend of increasing variance is similar to that for carbon, but with more clumping at the lower end of the range.
+
+```{r}
+
+dat <- DAT %>%
+  select(plot, harvest, treeopen, totalnitrogen) %>%
+  
+  group_by(plot) %>%
+  
+  mutate(plotmean = mean(totalnitrogen),
+         plotsd = sd(totalnitrogen)) %>%
+  
+  group_by(harvest, treeopen) %>%
+  
+  arrange(plotmean) %>%
+  
+  ungroup()
+
+
+ggplot(data = dat, aes(x = plotmean, y = totalnitrogen)) +
+  geom_point(size = 2, shape = 1) +
+
+  labs(x = "Mean plot value", y = "Core value") +
+  
+  GOPT +
+  
+  facet_grid(harvest ~ treeopen)
+
+```
+
+
+### Relation to individual variables
+
+In the following graphs, the blue horizontal and vertical bars (when present) indicate means and approximate 95% confidence intervals.
+
+```{r}
+
+plotfn <- function(xname, xlabel, 
+                   yname, ylabel,
+                   jitter = TRUE, 
+                   medians = FALSE, 
+                   ylogscale = TRUE, 
+                   by.harvest = TRUE,
+                   rugs = TRUE) {
+  
+  dat <- DAT[, c(xname, yname, "harvest")]
+  colnames(dat) <- c("x", "y", "harvest")
+  
+  if (is.factor(dat$x)) rugs <- FALSE
+  
+  jwidth <- ifelse(
+    !jitter, 
+    0, 
+    ifelse(
+      is.numeric(dat$x),
+      diff(range(dat$x, na.rm = TRUE)) / 50,
+      0.15))
+  
+  if (medians) {
+    if (by.harvest) q <- group_by(dat, x, harvest)
+    else q <- group_by(dat, x)
+    
+    q <- summarize(q, 
+                   mean = mean(y),
+                   se = sd(y) / sqrt(n()),
+                   lwr = mean - 2 * se, 
+                   upr = mean + 2 * se)
+  }
+  
+  g <- ggplot(data = dat, aes(x, y)) +
+    geom_point(colour = "black", shape = 1, size = 2,
+               position = position_jitter(width = jwidth, height = 0)) +
+    
+    labs(x = xlabel, y = ylabel) +
+    GOPT
+  
+  if (ylogscale) {
+    breaks <- switch(
+      yname,
+      "totalcarbon" = c(1, 2, 5, 10),
+      "totalnitrogen" = c(0.01, 0.05, 0.1, 0.5),
+      waiver())
+    
+    g <- g + scale_y_log10(breaks = breaks)
+  }
+  
+  if (medians) {
+    segw <- max(jwidth, 0.2)
+    segf <- function(x, sgn) { as.numeric(x) + sgn*segw }
+    
+    g <- g + 
+      geom_segment(data = q, 
+                   aes(x = segf(x, -1), xend = segf(x, 1), 
+                       y = mean, yend = mean),
+                   colour = "blue", size = 1) +
+      
+      geom_linerange(data = q,
+                     aes(x = x, ymin = lwr, ymax = upr),
+                     colour = "blue", size = 1,
+                     inherit.aes = FALSE)
+  }
+  
+  if (rugs) g <- g + geom_rug(sides = "b", colour = "darkred")
+    
+  if (by.harvest) g <- g + facet_wrap(~ harvest)
+  
+  g
+}
+
+
+# short-cut for total carbon
+plotfnC <- function(xname, xlabel, ...) {
+  args <- c(
+    list(xname = xname, xlabel = xlabel,
+         yname = "totalcarbon", ylabel = "Total carbon"), 
+    list(...)
+  )
+  
+  do.call(plotfn, args)
+}
+
+# short-cut for total nitrogen
+plotfnN <- function(xname, xlabel, ...) {
+  args <- c(
+    list(xname = xname, xlabel = xlabel,
+         yname = "totalnitrogen", ylabel = "Total nitrogen"), 
+    list(...)
+  )
+  
+  do.call(plotfn, args)
+}
+  
+```
+
+
+```{r}
+
+plotfnC("harvest", "Harvest", medians = TRUE, by.harvest = FALSE)
+
+```
+
+```{r}
+
+plotfnN("harvest", "Harvest", medians = TRUE, by.harvest = FALSE)
+
+```
+
+
+
+```{r}
+
+plotfnC("treeopen", "Micro-site", medians = TRUE)
+
+```
+
+```{r}
+
+plotfnN("treeopen", "Micro-site", medians = TRUE)
+
+```
+
+
+
+```{r}
+
+plotfnC("soilcolour", "Soil colour", medians = TRUE)
+
+```
+
+```{r}
+
+plotfnN("soilcolour", "Soil colour", medians = TRUE)
+
+```
+
+
+
+```{r}
+
+plotfnC("tsf", "Time since last fire (yrs)", rugs = FALSE)
+
+```
+
+```{r}
+
+plotfnN("tsf", "Time since last fire (yrs)", rugs = FALSE)
+
+```
+
+
+
+```{r}
+
+plotfnC("firessince1986", "Number of fires since 1986", medians = TRUE, rugs = FALSE)
+
+```
+
+```{r}
+
+plotfnN("firessince1986", "Number of fires since 1986", medians = TRUE, rugs = FALSE)
+
+```
+
+
+
+```{r}
+
+plotfnC("topsoildepth", "Top soil depth (cm)") + geom_smooth(method = "gam")
+
+```
+
+```{r}
+
+plotfnN("topsoildepth", "Top soil depth (cm)") + geom_smooth(method = "gam")
+
+```
+
+
+
+```{r}
+
+plotfnC("weightg", "Weight (grams)") + geom_smooth(method = "gam")
+
+```
+
+```{r}
+
+plotfnN("weightg", "Weight (grams)") + geom_smooth(method = "gam")
+
+```
+
+
+
+```{r}
+
+plotfnC("bulkdengcm3", expression(paste("Bulk density (g ", cm^3, ")"))) +
+  geom_smooth(method = "gam")
+
+```
+
+```{r}
+
+plotfnN("bulkdengcm3", expression(paste("Bulk density (g ", cm^3, ")"))) +
+  geom_smooth(method = "gam")
+
+```
+
+
+
+### Spatial and topographic patterns
+
+The following graph shows site locations, with point size proportional to the sum of total carbon values for cores within each site. 
+
+This is just to get a feel for the data and check for any obvious oddities. We can defer judgement of whether carbon values are spatially random or correlated until we fit some models and examine residuals.
+
+```{r fig.width=8, fig.height=8}
+
+dat <- DAT %>% 
+  select(plot, harvest, totalcarbon, easting, northing) %>%
+  group_by(plot, harvest) %>%
+  summarize(sumC = sum(totalcarbon),
+            easting = first(easting),
+            northing = first(northing)) %>%
+  ungroup()
+
+dem <- rasterToPoints(RDEM) %>%
+  as.data.frame()
+
+colnames(dem) <- c("easting", "northing", "elevation")
+
+ggplot(data = dem, aes(x = easting, y = northing)) + 
+  geom_raster(aes(fill = elevation), alpha = 0.8) + 
+  scale_fill_distiller(name = "Elevation", palette = "BuPu", 
+                       guide = guide_colourbar(label.vjust = 1)) +
+  
+  geom_contour(aes(z = elevation), binwidth = 20, colour = "brown") +
+  
+  geom_point(data = dat,
+             aes(x = easting, y = northing, 
+                 size = sumC, colour = harvest)) +
+  
+  geom_point(data = dat,
+             aes(x = easting, y = northing, size = sumC),
+             shape = 1, colour = "black") +
+  
+  scale_radius(range = c(2, 10), guide = "none") +
+  scale_colour_brewer(name = "Treatment", palette = "Dark2",
+                      guide = guide_legend(override.aes = list(size = 4))) +
+
+  coord_equal() +
+
+  GOPT
+
+```
+
+
+
+The same view for nitrogen.
+
+```{r fig.width=8, fig.height=8}
+
+dat <- DAT %>% 
+  select(plot, harvest, totalnitrogen, easting, northing) %>%
+  group_by(plot, harvest) %>%
+  summarize(sumN = sum(totalnitrogen),
+            easting = first(easting),
+            northing = first(northing)) %>%
+  ungroup()
+
+dem <- rasterToPoints(RDEM) %>%
+  as.data.frame()
+
+colnames(dem) <- c("easting", "northing", "elevation")
+
+ggplot(data = dem, aes(x = easting, y = northing)) + 
+  geom_raster(aes(fill = elevation), alpha = 0.8) + 
+  scale_fill_distiller(name = "Elevation", palette = "BuPu", 
+                       guide = guide_colourbar(label.vjust = 1)) +
+  
+  geom_contour(aes(z = elevation), binwidth = 20, colour = "brown") +
+  
+  geom_point(data = dat,
+             aes(x = easting, y = northing, 
+                 size = sumN, colour = harvest)) +
+  
+  geom_point(data = dat,
+             aes(x = easting, y = northing, size = sumN),
+             shape = 1, colour = "black") +
+  
+  scale_radius(range = c(2, 10), guide = "none") +
+  scale_colour_brewer(name = "Treatment", palette = "Dark2",
+                      guide = guide_legend(override.aes = list(size = 4))) +
+
+  coord_equal() +
+
+  GOPT
+  
+  
+
+```
+
+
+
+```{r}
+
+plotfnC("elevation", "Elevation", jitter = FALSE) +
+  geom_smooth(method = "gam")
+
+```
+
+```{r}
+
+plotfnN("elevation", "Elevation", jitter = FALSE) +
+  geom_smooth(method = "gam")
+
+```
+
+
+
+```{r}
+
+plotfnC("slope", "Slope", jitter = FALSE) +
+  geom_smooth(method = "gam")
+
+```
+
+```{r}
+
+plotfnN("slope", "Slope", jitter = FALSE) +
+  geom_smooth(method = "gam")
+
+```
+
+
+
+```{r}
+
+plotfnC("northness", "Northness (sine aspect/2)", jitter = FALSE) +
+  geom_smooth(method = "gam")
+
+```
+
+```{r}
+
+plotfnN("northness", "Northness (sine aspect/2)", jitter = FALSE) +
+  geom_smooth(method = "gam")
+
+```
+
