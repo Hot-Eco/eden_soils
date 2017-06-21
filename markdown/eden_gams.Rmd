@@ -10,10 +10,12 @@ output:
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
 
-library(tidyverse)
+library(mxbutils)
+
+library(dplyr)
+library(ggplot2)
 library(mgcv)
 library(ncf)  # for correlograms
-library(mxbstuff)
 
 # Set to TRUE to run correlograms (time consuming)
 # or FALSE to load previously saved results
@@ -98,7 +100,9 @@ Carbon (t/ha) = Depth (cm) x Bulk density (g/cm3) x Carbon content (%)
 
 ```{r echo = TRUE}
 
-dat.model <- DAT
+dat.model <- DAT %>%
+  select(plot, carbontha, nfires, harvest, treeopen)
+
 dat.model$flag <- 1  # turns on site random effect
 
 mcarbon <- gam(log(carbontha) ~ s(nfires, bs = "tp", k=8, fx=FALSE, by = harvest) +
@@ -143,7 +147,7 @@ g <- ggplot(data = dat.gg, aes(x = nfires)) +
   
   scale_x_continuous(breaks = 0:max(dat.gg$nfires)) +
   
-  labs(x = "Number of fires", y = "Carbon (tonne per ha)") +
+  labs(x = "Number of fires", y = "Carbon (Mg/ha)") +
   
   facet_grid(treeopen ~ harvest) +
   
@@ -183,6 +187,11 @@ knitr::kable(x)
 
 ```{r echo = TRUE}
 
+dat.model <- DAT %>%
+  select(plot, nitrogentha, nfires, harvest, treeopen)
+
+dat.model$flag <- 1
+
 mnitrogen <- gam(log(nitrogentha) ~ s(nfires, k=8, by = harvest) +
                  harvest + treeopen +
                  s(plot, bs = "re", by = flag),
@@ -215,7 +224,7 @@ g <- ggplot(data = dat.gg, aes(x = nfires)) +
   
   scale_x_continuous(breaks = 0:max(dat.gg$nfires)) +
   
-  labs(x = "Number of fires", y = "Nitrogen (tonne per ha)") +
+  labs(x = "Number of fires", y = "Nitrogen (Mg/ha)") +
   
   facet_grid(treeopen ~ harvest) +
   
@@ -259,6 +268,9 @@ Distribution of values within fire x harvest classes:
 
 ```{r}
 
+dat.model <- DAT %>%
+  select(plot, cnratio, nfires, harvest, treeopen)
+
 ggplot(data = dat.model, aes(x = cnratio)) +
   geom_histogram(colour = "black", fill = "grey80", binwidth = 10) +
   labs(x = "Carbon to nitrogen ratio") +
@@ -293,6 +305,8 @@ This model is fitted using a scaled t-distribution (with the argument `family = 
 
 
 ```{r echo = TRUE}
+
+dat.model$flag <- 1
 
 mratio <- gam(log(cnratio) ~ s(nfires, k=8, by = harvest) +
                  harvest + treeopen +
@@ -383,7 +397,7 @@ Points have been horizontally jittered for clarity.
 
 ```{r}
 
-dat <- filter(dat.model, !is.na(topsoildepth))
+dat <- filter(DAT, !is.na(topsoildepth))
 
 ggplot(data = dat, aes(x = topsoildepth, y = carbontha)) +
   geom_point(shape = 1, size = 2, 
